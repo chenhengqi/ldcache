@@ -9,6 +9,8 @@
 #define CACHE_MAGIC "ld.so-1.7.0"
 #define CACHE_MAGIC_NEW "glibc-ld.so.cache1.1"
 
+#define FLAG_ELF 0x01
+
 struct header
 {
 	char magic[sizeof(CACHE_MAGIC) - 1];
@@ -39,52 +41,35 @@ struct entry_new
 	uint64_t hwcap;
 };
 
-static inline const char *align(const char *address, size_t boundary)
+static const char *align(const char *address, size_t alignment)
 {
-	if ((size_t)address % boundary == 0) {
+	if ((size_t)address % alignment == 0) {
 		return address;
 	}
-	return (address + boundary) - ((size_t)address % boundary);
+	return (address + alignment) - ((size_t)address % alignment);
 }
 
-struct cache_entry *parse(const char *path)
-{
-	FILE * f;
-	char *data, *pos, *strs;
-	long size;
+static struct ldcache *parse(const char *data, long size, int old) {
+	char *pos, *strs;
 	struct header *hdr;
 	struct header_new *hdr_new;
 	struct entry_new *entry_new;
-	struct cache_entry *entries;
+	struct ldcache *cache;
 	int i, n;
 
-	f = fopen(path, "rb");
-	if (!f) {
-		return NULL;
-	}
+	pos = (char *)data;
 
-	fseek(f, 0, SEEK_END);
-	size = ftell(f);
-	fseek(f, 0, SEEK_SET);
-	data = malloc(size);
-	if (!data) {
-		fclose(f);
-		return NULL;
-	}
-	fread(data, 1, size, f);
+	if (old) {
+		hdr = (struct header *)pos;
+		pos += sizeof(struct header);
+		if (pos >= data + size) {
+			return NULL;
+		}
 
-	printf("read file ok\n");
-
-	pos = data;
-	hdr = (struct header *)pos;
-	pos += sizeof(struct header);
-	if (pos >= data + size) {
-		return NULL;
-	}
-
-	pos += hdr->lib_count * sizeof(struct entry);
-	if (pos >= data + size) {
-		return NULL;
+		pos += sizeof(struct entry) * hdr->lib_count;
+		if (pos >= data + size) {
+			return NULL;
+		}
 	}
 
 	pos = (char *)align(pos, __alignof__(struct header_new));
@@ -99,61 +84,114 @@ struct cache_entry *parse(const char *path)
 	}
 
 	entry_new = (struct entry_new *)pos;
-	pos += hdr_new->lib_count * sizeof(struct entry_new);
+	pos += sizeof(struct entry_new) * hdr_new->lib_count;
 	if (pos >= data + size) {
 		return NULL;
 	}
 
-	strs = (char*)hdr_new;
+	strs = (char *)hdr_new;
 
 	pos += hdr_new->strs_len;
 	if (pos - data != size) {
 		return NULL;
 	}
 
-	printf("get strs ok\n");
-
-	if (strncmp(hdr->magic, CACHE_MAGIC, sizeof(CACHE_MAGIC) - 1)) {
-		return NULL;
+	if (old) {
+		if (strncmp(hdr->magic, CACHE_MAGIC, sizeof(CACHE_MAGIC) - 1)) {
+			return NULL;
+		}
 	}
 
 	if (strncmp(hdr_new->magic, CACHE_MAGIC_NEW, sizeof(CACHE_MAGIC_NEW) - 1)) {
 		return NULL;
 	}
 
-	printf("check magic ok\n");
-
 	if (*(pos - 1) != '\0') {
 		return NULL;
 	}
 
-	entries = calloc(hdr_new->lib_count + 1, sizeof(struct cache_entry));
-	if (!entries) {
+	cache = malloc(sizeof(struct ldcache));
+	if (!cache) {
 		return NULL;
 	}
-	bzero(entries, (hdr_new->lib_count + 1) * sizeof(struct cache_entry));
+	bzero(cache, sizeof(struct ldcache));
 
-	printf("alloc memory ok\n");
+	cache->entries = calloc(hdr_new->lib_count, sizeof(struct ldcache_entry));
+	if (!cache->entries) {
+		free(cache);
+		return NULL;
+	}
+	bzero(cache->entries, sizeof(struct ldcache_entry) * hdr_new->lib_count);
 
 	for (i = 0, n = 0; i < hdr_new->lib_count; i++) {
-		if (!(entry_new[i].flags & 0x01)) {
+		if (!(entry_new[i].flags & FLAG_ELF)) {
 			continue;
 		}
 
 		if (strs + entry_new[i].key >= pos) {
-			return NULL;
+			goto cleanup;
 		}
 
 		if (strs + entry_new[i].value >= pos) {
-			return NULL;
+			goto cleanup;
 		}
 
-		strncpy(entries[n].name, &strs[entry_new[i].key],
+		strncpy(cache->entries[n].name, &strs[entry_new[i].key],
 			strlen(&strs[entry_new[i].key]));
-		strncpy(entries[n].path, &strs[entry_new[i].value],
+		strncpy(cache->entries[n].path, &strs[entry_new[i].value],
 			strlen(&strs[entry_new[i].value]));
 		n++;
 	}
 
-	return entries;
+	cache->size = n;
+	return cache;
+
+cleanup:
+	free(cache->entries);
+	free(cache);
+	return NULL;
+}
+
+struct ldcache *parse_ldcache(const char *path)
+{
+	struct ldcache *cache = NULL;
+	FILE *f;
+	char *data;
+	long size;
+
+	f = fopen(path, "rb");
+	if (!f) {
+		return NULL;
+	}
+
+	fseek(f, 0, SEEK_END);
+	size = ftell(f);
+	rewind(f);
+	data = malloc(size);
+	if (!data) {
+		fclose(f);
+		return NULL;
+	}
+	fread(data, 1, size, f);
+	fclose(f);
+
+	if (data[0] == 'l') {
+		cache = parse(data, size, 1);
+	}
+
+	if (data[0] == 'g') {
+		cache = parse(data, size, 0);
+	}
+
+	free(data);
+	return cache;
+}
+
+void free_ldcache(struct ldcache *cache)
+{
+	if (!cache) {
+		return;
+	}
+	free(cache->entries);
+	free(cache);
 }
